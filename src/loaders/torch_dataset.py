@@ -2,31 +2,38 @@
 
 This module provides a Torch-compatible Dataset class that wraps any MOABB
 dataset and paradigm pipeline, enabling integration with Torch DataLoaders.
+Supports both STFT spectrogram and raw signal representations.
 
 Example:
     from torch.utils.data import DataLoader
     from moabb.datasets import BNCI2014_001
     from moabb.paradigms import MotorImagery
-    from src.train_utils import STFTDataset, STFTDatasetConfig
+    from src.loaders import EEGDataset, EEGDatasetConfig
 
     dataset = BNCI2014_001()
     paradigm = MotorImagery(fmin=4, fmax=40, resample=250, tmin=0, tmax=4)
 
-    config = STFTDatasetConfig(
+    # STFT representation (default)
+    config = EEGDatasetConfig(
         paradigm=paradigm,
         window_sec=2.0,
         window_overlap=0.9,
     )
-    torch_dataset = STFTDataset(dataset, config)
-    loader = DataLoader(torch_dataset, batch_size=64, shuffle=True, num_workers=4)
+    torch_dataset = EEGDataset(dataset, config)
 
-    for X, y in loader:
-        # X: (batch, channels, freqs, times)
-        # y: (batch,)
-        ...
+    # Raw signal representation
+    raw_config = EEGDatasetConfig(
+        paradigm=paradigm,
+        representation="raw",
+        window_sec=2.0,
+        window_overlap=0.9,
+    )
+    raw_dataset = EEGDataset(dataset, raw_config)
 """
 
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -35,39 +42,50 @@ from torch.utils.data import Dataset
 from moabb.datasets.base import BaseDataset
 from moabb.paradigms.base import BaseParadigm
 
-from ..data_proc import inject_sliding_window_stft
+from ..data_proc import inject_sliding_window, inject_sliding_window_stft
 
 
 @dataclass
-class STFTDatasetConfig:
-    """Configuration for STFTDataset.
+class EEGDatasetConfig:
+    """Configuration for EEGDataset.
 
     Centralizes preprocessing and windowing parameters. The paradigm object
     defines filtering, resampling, and epoch extraction. This config handles
-    the sliding window STFT stage and caching.
+    the sliding window stage (and optionally STFT) and caching.
 
     Attributes:
         paradigm: MOABB paradigm instance (e.g., MotorImagery). Defines fmin,
             fmax, resample, tmin, tmax, events, etc.
+        representation: Signal representation - "stft" for spectrograms,
+            "raw" for windowed time-domain signal.
         subjects: List of subject IDs to load. None means all subjects.
         window_sec: Sliding window length in seconds.
         window_overlap: Window overlap ratio in [0.0, 0.99].
-        stft_nperseg: STFT segment length.
-        stft_overlap: STFT segment overlap.
-        cache_path: Path for MOABB cache. None disables caching.
+        stft_nperseg: STFT segment length (only used when representation="stft").
+        stft_overlap: STFT segment overlap (only used when representation="stft").
         use_cache: Whether to use MOABB's array caching.
+        regen_cache: If True, overwrite existing cached arrays. Useful when
+            preprocessing config changed since the last cached run.
+        cache_path: Path for MOABB cache. None disables caching.
         dtype: numpy dtype for data arrays.
     """
 
     paradigm: BaseParadigm
+    representation: str = "stft"
     subjects: Optional[list[int]] = None
     window_sec: float = 2.0
     window_overlap: float = 0.9
     stft_nperseg: int = 64
     stft_overlap: int = 48
-    cache_path: Optional[str] = "./moabb_cache"
     use_cache: bool = True
+    regen_cache: bool = False
+    cache_path: Optional[str] = "./moabb_cache"
     dtype: np.dtype = np.float32
+
+    def __post_init__(self):
+        if self.representation not in ("stft", "raw"):
+            raise ValueError(f"Unknown representation '{self.representation}', "
+                             f"must be 'stft' or 'raw'")
 
     def get_n_times(self, dataset: BaseDataset) -> int:
         """Compute number of time samples per epoch for a given dataset.
@@ -100,34 +118,40 @@ class STFTDatasetConfig:
         """
         if self.paradigm.resample is None:
             raise ValueError(
-                "paradigm.resample must be set for sliding window STFT. "
+                "paradigm.resample must be set for sliding window extraction. "
                 "The transform requires a known, fixed sampling rate."
             )
         return float(self.paradigm.resample)
 
 
-class STFTDataset(Dataset):
+# Backward compat alias
+STFTDatasetConfig = EEGDatasetConfig
+
+
+class EEGDataset(Dataset):
     """Torch Dataset for Motor Imagery EEG data.
 
-    Wraps any MOABB dataset and paradigm pipeline to provide windowed STFT
-    spectrograms as torch tensors. Data is loaded once at initialization
-    and stored in memory for fast access during training.
+    Wraps any MOABB dataset and paradigm pipeline to provide either windowed STFT
+    spectrograms or raw windowed signal as torch tensors. Data is loaded once at
+    initialization and stored in memory for fast access during training.
 
     The class handles:
-        - Pipeline injection for sliding window STFT
+        - Pipeline injection for sliding window (+ optional STFT)
         - Label encoding (string -> integer)
         - Conversion to torch tensors
 
     Attributes:
         config: Dataset configuration.
-        data: Preprocessed EEG data as tensor (n_windows, n_channels, n_freqs, n_times).
+        data: Preprocessed EEG data as tensor.
+            STFT: (n_windows, n_channels, n_freqs, n_times).
+            Raw: (n_windows, n_channels, n_samples).
         labels: Integer class labels as tensor (n_windows,).
         metadata: Original MOABB metadata DataFrame.
         label_map: Mapping from class names to integer indices.
         window_config: Sliding window configuration used for preprocessing.
     """
 
-    def __init__(self, dataset: BaseDataset, config: STFTDatasetConfig) -> None:
+    def __init__(self, dataset: BaseDataset, config: EEGDatasetConfig) -> None:
         """Initialize the dataset.
 
         Loads and preprocesses all data according to the configuration.
@@ -151,15 +175,33 @@ class STFTDataset(Dataset):
         sfreq = self.config.get_sfreq()
         n_times = self.config.get_n_times(dataset)
 
-        self.window_config = inject_sliding_window_stft(
-            process_pipeline,
-            sfreq=sfreq,
-            window_sec=self.config.window_sec,
-            window_overlap=self.config.window_overlap,
-            n_times=n_times,
-            stft_nperseg=self.config.stft_nperseg,
-            stft_overlap=self.config.stft_overlap,
-        )
+        if self.config.representation == "stft":
+            self.window_config = inject_sliding_window_stft(
+                process_pipeline,
+                sfreq=sfreq,
+                window_sec=self.config.window_sec,
+                window_overlap=self.config.window_overlap,
+                n_times=n_times,
+                stft_nperseg=self.config.stft_nperseg,
+                stft_overlap=self.config.stft_overlap,
+            )
+        else:
+            self.window_config = inject_sliding_window(
+                process_pipeline,
+                sfreq=sfreq,
+                window_sec=self.config.window_sec,
+                window_overlap=self.config.window_overlap,
+                n_times=n_times,
+            )
+
+        if (
+            self.config.regen_cache
+            and self.config.use_cache
+            and self.config.cache_path is not None
+        ):
+            cache_dir = Path(self.config.cache_path)
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
 
         cache_config = self._make_cache_config()
 
@@ -208,7 +250,8 @@ class STFTDataset(Dataset):
 
         Returns:
             Tuple of (data, label) tensors.
-            data: (n_channels, n_freqs, n_times) spectrogram.
+            STFT: data is (n_channels, n_freqs, n_times) spectrogram.
+            Raw: data is (n_channels, n_samples) signal.
             label: Scalar integer class label.
         """
         return self.data[idx], self.labels[idx]
@@ -219,19 +262,13 @@ class STFTDataset(Dataset):
         return self.data.shape[1]
 
     @property
-    def n_freqs(self) -> int:
-        """Number of frequency bins in STFT output."""
-        return self.data.shape[2]
+    def input_shape(self) -> tuple[int, ...]:
+        """Shape of a single input sample.
 
-    @property
-    def n_stft_times(self) -> int:
-        """Number of time steps in STFT output."""
-        return self.data.shape[3]
-
-    @property
-    def input_shape(self) -> tuple[int, int, int]:
-        """Shape of a single input sample (channels, freqs, times)."""
-        return self.n_channels, self.n_freqs, self.n_stft_times
+        STFT: (channels, freqs, times).
+        Raw: (channels, samples).
+        """
+        return tuple(self.data.shape[1:])
 
     @property
     def n_classes(self) -> int:
@@ -272,7 +309,7 @@ class STFTDataset(Dataset):
 
     def split_by_subject(
         self, train_subjects: list[int], test_subjects: list[int]
-    ) -> tuple["SubsetSTFTDataset", "SubsetSTFTDataset"]:
+    ) -> tuple["SubsetEEGDataset", "SubsetEEGDataset"]:
         """Create train/test splits based on subject IDs.
 
         This is the proper way to evaluate generalization across subjects,
@@ -283,7 +320,7 @@ class STFTDataset(Dataset):
             test_subjects: Subject IDs for test set.
 
         Returns:
-            Tuple of (train_dataset, test_dataset) as SubsetSTFTDataset objects.
+            Tuple of (train_dataset, test_dataset) as SubsetEEGDataset objects.
         """
         train_mask = self.metadata["subject"].isin(train_subjects).values
         test_mask = self.metadata["subject"].isin(test_subjects).values
@@ -292,13 +329,13 @@ class STFTDataset(Dataset):
         test_indices = np.where(test_mask)[0]
 
         return (
-            SubsetSTFTDataset(self, train_indices),
-            SubsetSTFTDataset(self, test_indices),
+            SubsetEEGDataset(self, train_indices),
+            SubsetEEGDataset(self, test_indices),
         )
 
     def split_by_session(
         self, train_sessions: list[str], test_sessions: list[str]
-    ) -> tuple["SubsetSTFTDataset", "SubsetSTFTDataset"]:
+    ) -> tuple["SubsetEEGDataset", "SubsetEEGDataset"]:
         """Create train/test splits based on session IDs.
 
         Useful for within-subject cross-session evaluation.
@@ -308,7 +345,7 @@ class STFTDataset(Dataset):
             test_sessions: Session IDs for test set.
 
         Returns:
-            Tuple of (train_dataset, test_dataset) as SubsetSTFTDataset objects.
+            Tuple of (train_dataset, test_dataset) as SubsetEEGDataset objects.
         """
         train_mask = self.metadata["session"].isin(train_sessions).values
         test_mask = self.metadata["session"].isin(test_sessions).values
@@ -317,27 +354,31 @@ class STFTDataset(Dataset):
         test_indices = np.where(test_mask)[0]
 
         return (
-            SubsetSTFTDataset(self, train_indices),
-            SubsetSTFTDataset(self, test_indices),
+            SubsetEEGDataset(self, train_indices),
+            SubsetEEGDataset(self, test_indices),
         )
 
 
-class SubsetSTFTDataset(Dataset):
-    """A subset view of STFTDataset.
+# Backward compat alias
+STFTDataset = EEGDataset
+
+
+class SubsetEEGDataset(Dataset):
+    """A subset view of EEGDataset.
 
     Provides a Dataset interface over a subset of indices from the parent
-    STFTDataset. Does not copy data, just indexes into the parent.
+    EEGDataset. Does not copy data, just indexes into the parent.
 
     Attributes:
-        parent: The parent STFTDataset.
+        parent: The parent EEGDataset.
         indices: Array of valid indices into the parent dataset.
     """
 
-    def __init__(self, parent: STFTDataset, indices: np.ndarray) -> None:
+    def __init__(self, parent: EEGDataset, indices: np.ndarray) -> None:
         """Initialize subset dataset.
 
         Args:
-            parent: Parent STFTDataset to take subset from.
+            parent: Parent EEGDataset to take subset from.
             indices: Array of indices to include in this subset.
         """
         self.parent = parent
@@ -370,8 +411,8 @@ class SubsetSTFTDataset(Dataset):
         return self.parent.labels[self.indices]
 
     @property
-    def input_shape(self) -> tuple[int, int, int]:
-        """Shape of a single input sample (channels, freqs, times)."""
+    def input_shape(self) -> tuple[int, ...]:
+        """Shape of a single input sample."""
         return self.parent.input_shape
 
     @property
@@ -393,3 +434,7 @@ class SubsetSTFTDataset(Dataset):
         _, counts = torch.unique(self.labels, return_counts=True)
         weights = 1.0 / counts.float()
         return weights / weights.sum() * len(weights)
+
+
+# Backward compat alias
+SubsetSTFTDataset = SubsetEEGDataset

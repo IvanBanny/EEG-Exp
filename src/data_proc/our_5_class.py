@@ -54,6 +54,13 @@ class Our5Class(BaseDataset):
     MONTAGE = "standard_1020"
     DEFAULT_SFREQ = 1000
 
+    # Marker timestamps are relative to experiment start, but each .poly5 recording has a
+    # variable-length preamble (the get-FPS phase) at its front. The experiment occupies
+    # exactly the last EXPERIMENT_DURATION_S seconds of the file, so we crop the preamble
+    # before attaching annotations to align marker t=0 with raw sample 0.
+    EXPERIMENT_DURATION_S = 600.0
+    EXPERIMENT_DURATION_S_OVERRIDES = {14: 767.55}
+
     def __init__(self, data_path="our_data/our_5_class", get_last_trials_xor=None):
         """
         Args:
@@ -103,17 +110,23 @@ class Our5Class(BaseDataset):
         session_key = "0"  # Single session (subject doesn't take the headset off), multiple runs
         sessions[session_key] = dict()
 
+        experiment_duration_s = self.EXPERIMENT_DURATION_S_OVERRIDES.get(
+            subject, self.EXPERIMENT_DURATION_S)
+
         for run_idx, poly5_path in enumerate(poly5_files):
-            raw = self._load_single_run(poly5_path)
+            raw = self._load_single_run(poly5_path, experiment_duration_s)
             sessions[session_key][str(run_idx)] = raw
 
         return sessions
 
-    def _load_single_run(self, poly5_path: Path) -> mne.io.RawArray:
+    def _load_single_run(self, poly5_path: Path, experiment_duration_s: float) -> mne.io.RawArray:
         """Load and preprocess a single recording run.
 
         Args:
             poly5_path: Path to the poly5 file.
+            experiment_duration_s: Expected duration of the experiment in seconds. The file's
+                leading preamble (file duration - experiment_duration_s) is cropped off so
+                marker timestamps (experiment-relative) align with raw sample 0.
 
         Returns:
             MNE Raw object with proper channel types, montage, and event annotations added.
@@ -139,6 +152,15 @@ class Our5Class(BaseDataset):
         raw.set_eeg_reference(ref_channels=self.REF_CHANNELS)
         raw.drop_channels(self.REF_CHANNELS)
 
+        # Crop preamble so marker t=0 aligns with sample 0
+        file_duration_s = raw.n_times / raw.info["sfreq"]
+        crop_tmin = file_duration_s - experiment_duration_s
+        if crop_tmin < 0:
+            raise ValueError(
+                f"File {poly5_path.name} is shorter ({file_duration_s:.2f}s) than expected "
+                f"experiment duration ({experiment_duration_s:.2f}s)")
+        raw.crop(tmin=crop_tmin)
+
         # Load markers as annotations
         markers = self._load_markers(poly5_path)
         if markers:
@@ -147,7 +169,7 @@ class Our5Class(BaseDataset):
         return raw
 
     def _load_markers(self, poly5_path: Path) -> list[dict]:
-        """Load trial markers from corresponding csv file.
+        """Load trial markers from CSV corresponding to a poly5 file.
 
         Args:
             poly5_path: Path to the poly5 file. Marker file is expected to have the same stem

@@ -1,5 +1,6 @@
 import torch
 
+
 class GaussianNoise:
     """Add random noise."""
     def __init__(self, std=0.1):
@@ -9,12 +10,14 @@ class GaussianNoise:
         return x + torch.randn_like(x) * self.std
 
 class RandomScale:
-    """Randomly scale amplitude."""
+    """Randomly scale amplitude per channel."""
     def __init__(self, scale_fork=(0.8, 1.2)):
         self.scale_fork = scale_fork
 
     def __call__(self, x):
-        scale = torch.empty(x.shape[0], 1, 1, dtype=x.dtype, device=x.device).uniform_(*self.scale_fork)
+        # Per-channel scale, broadcast over remaining dims
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        scale = torch.empty(shape, dtype=x.dtype, device=x.device).uniform_(*self.scale_fork)
         return x * scale
 
 class TimeShift:
@@ -36,5 +39,7 @@ class ChannelDropout:
         self.p = p
 
     def __call__(self, x):
-        mask = (torch.rand(x.shape[0], 1, 1, device=x.device) > self.p).to(x.dtype)
+        # Per-channel mask, broadcast over remaining dims
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = (torch.rand(shape, device=x.device) > self.p).to(x.dtype)
         return x * mask

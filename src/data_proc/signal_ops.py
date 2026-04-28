@@ -30,16 +30,12 @@ class SlidingWindowConfig:
         window_sec: Window length in seconds.
         window_overlap: Window overlap ratio [0.0 to 0.99].
         n_times: Number of time samples per trial.
-        stft_nperseg: Length of each STFT segment.
-        stft_overlap: STFT window overlap.
     """
 
     sfreq: float
     window_sec: float
     window_overlap: float
     n_times: int
-    stft_nperseg: int = 64
-    stft_overlap: int = 48
 
     @property
     def window_samples(self) -> int:
@@ -73,15 +69,15 @@ class SlidingWindowConfig:
                              f"n_times={self.n_times}, step_samples={self.step_samples}.")
 
 
-def make_sliding_window_stft_fn(config: SlidingWindowConfig) -> Callable[[np.ndarray], np.ndarray]:
-    """Create a sliding window STFT transform function.
+def make_sliding_window_fn(config: SlidingWindowConfig) -> Callable[[np.ndarray], np.ndarray]:
+    """Create a sliding window transform function (no STFT).
 
     Args:
         config: Sliding window configuration.
 
     Returns:
         Transform function that takes (n_trials, n_channels, n_times) array
-        and returns (n_windows_total, n_channels, n_freqs, n_stft_times) array,
+        and returns (n_windows_total, n_channels, window_samples) array,
         where n_windows_total = n_trials * windows_per_trial.
     """
     config.validate()
@@ -95,9 +91,7 @@ def make_sliding_window_stft_fn(config: SlidingWindowConfig) -> Callable[[np.nda
             start = 0
             while start + config.window_samples <= n_times:
                 window = trial[:, start:start + config.window_samples]
-                _, _, Zxx = stft(window, fs=config.sfreq, nperseg=config.stft_nperseg,
-                                 noverlap=config.stft_overlap, axis=-1)
-                all_windows.append(np.abs(Zxx))
+                all_windows.append(window)
                 start += config.step_samples
                 trial_windows += 1
 
@@ -109,6 +103,62 @@ def make_sliding_window_stft_fn(config: SlidingWindowConfig) -> Callable[[np.nda
                 )
 
         return np.array(all_windows)
+
+    return transform
+
+
+def make_stft_fn(
+    sfreq: float,
+    nperseg: int = 64,
+    noverlap: int = 48
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Create an STFT transform function.
+
+    Operates on already-windowed data. Applies STFT independently per window.
+
+    Args:
+        sfreq: Sampling frequency in Hz.
+        nperseg: Length of each STFT segment.
+        noverlap: STFT segment overlap.
+
+    Returns:
+        Transform function that takes (n_windows, n_channels, n_samples) array
+        and returns (n_windows, n_channels, n_freqs, n_stft_times) magnitude array.
+    """
+    def transform(X: np.ndarray) -> np.ndarray:
+        all_specs = []
+        for window in X:
+            _, _, Zxx = stft(window, fs=sfreq, nperseg=nperseg,
+                             noverlap=noverlap, axis=-1)
+            all_specs.append(np.abs(Zxx))
+        return np.array(all_specs)
+
+    return transform
+
+
+def make_sliding_window_stft_fn(
+    config: SlidingWindowConfig,
+    stft_nperseg: int = 64,
+    stft_overlap: int = 48
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Create a combined sliding window + STFT transform function.
+
+    Convenience composition of make_sliding_window_fn and make_stft_fn.
+
+    Args:
+        config: Sliding window configuration.
+        stft_nperseg: Length of each STFT segment.
+        stft_overlap: STFT window overlap.
+
+    Returns:
+        Transform function that takes (n_trials, n_channels, n_times) array
+        and returns (n_windows_total, n_channels, n_freqs, n_stft_times) array.
+    """
+    window_fn = make_sliding_window_fn(config)
+    stft_fn = make_stft_fn(config.sfreq, stft_nperseg, stft_overlap)
+
+    def transform(X: np.ndarray) -> np.ndarray:
+        return stft_fn(window_fn(X))
 
     return transform
 
@@ -180,6 +230,49 @@ def inject_array_transforms(
     )
 
 
+def inject_sliding_window(
+    process_pipeline: Pipeline,
+    sfreq: float,
+    window_sec: float,
+    window_overlap: float,
+    n_times: int
+) -> SlidingWindowConfig:
+    """Inject sliding window transform (no STFT) into MOABB pipeline.
+
+    Produces raw windowed signal: (n_windows, n_channels, window_samples).
+
+    Args:
+        process_pipeline: MOABB process pipeline (modified in-place).
+        sfreq: Sampling frequency in Hz.
+        window_sec: Window length in seconds.
+        window_overlap: Window overlap ratio [0.0 to 0.99].
+        n_times: Number of time samples per trial.
+
+    Returns:
+        SlidingWindowConfig used for the transforms.
+    """
+    config = SlidingWindowConfig(
+        sfreq=sfreq,
+        window_sec=window_sec,
+        window_overlap=window_overlap,
+        n_times=n_times,
+    )
+    config.validate()
+
+    window_fn = make_sliding_window_fn(config)
+    expand_fn = make_label_expander_fn(config)
+
+    inject_array_transforms(
+        process_pipeline,
+        x_transform=window_fn,
+        events_transform=expand_fn,
+        x_name="sliding_window",
+        events_name="expand_labels"
+    )
+
+    return config
+
+
 def inject_sliding_window_stft(
     process_pipeline: Pipeline,
     sfreq: float,
@@ -229,12 +322,10 @@ def inject_sliding_window_stft(
         window_sec=window_sec,
         window_overlap=window_overlap,
         n_times=n_times,
-        stft_nperseg=stft_nperseg,
-        stft_overlap=stft_overlap
     )
     config.validate()
 
-    stft_fn = make_sliding_window_stft_fn(config)
+    stft_fn = make_sliding_window_stft_fn(config, stft_nperseg, stft_overlap)
     expand_fn = make_label_expander_fn(config)
 
     inject_array_transforms(

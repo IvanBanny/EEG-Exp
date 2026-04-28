@@ -3,6 +3,20 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import random_split, Subset
 from sklearn.model_selection import train_test_split, KFold, StratifiedKFold
 
+
+def collate_eeg(batch):
+    """Collate function for fixed-size EEG windows.
+
+    Works with any tensor dimensionality (2D raw signal or 3D spectrograms).
+    All samples must have the same shape (guaranteed by sliding window extraction).
+    """
+    signals, labels = zip(*batch)
+    signals = torch.stack(signals)
+    labels = torch.stack(labels)
+    lengths = torch.full((signals.shape[0],), signals.shape[-1], dtype=torch.long)
+    return signals, labels, lengths
+
+
 def collate_spectrograms(batch):
     """Custom collate that pads ch x H x W spectrograms and returns lengths."""
     signals, labels = zip(*batch)

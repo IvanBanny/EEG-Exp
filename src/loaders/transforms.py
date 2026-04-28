@@ -61,6 +61,13 @@ class RobustScaler:
         return (x - median) / (iqr + self.eps)
 # ^^^ :skull:skull:skull ^^^
 
+class LogCompress:
+    """Apply log(1 + x) to compress STFT magnitude dynamic range."""
+
+    def __call__(self, x):
+        return torch.log1p(x)
+
+
 class ClipOutliers:
     """Clip extreme values (common for EEG)."""
     def __init__(self, sigma=5.0):

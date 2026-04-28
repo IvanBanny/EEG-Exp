@@ -1,19 +1,18 @@
-"""A CNN-BiLSTM implementation for STFT spectrograms."""
+"""A 1D CNN-BiLSTM implementation for raw EEG signal."""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation block for channel-wise attention.
+class SE1DBlock(nn.Module):
+    """Squeeze-and-Excitation block for 1D feature maps.
 
-    Helps the model focus on relevant feature channels (frequencies/patterns)
-    while suppressing noise.
+    Channel-wise attention over (B, C, T) tensors.
     """
     def __init__(self, in_channels, reduction=4):
         super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Sequential(
             nn.Linear(in_channels, in_channels // reduction, bias=False),
             nn.ReLU(inplace=True),
@@ -22,44 +21,53 @@ class SEBlock(nn.Module):
         )
 
     def forward(self, x):
-        b, c, _, _ = x.size()
+        # x: (B, C, T)
+        b, c, _ = x.size()
         y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
+        y = self.fc(y).view(b, c, 1)
         return x * y.expand_as(x)
 
 
-class STFT_CNN_BiLSTM(nn.Module):
-    """CNN + BiLSTM for STFT spectrogram MI classification.
+class Raw_CNN_BiLSTM(nn.Module):
+    """1D CNN + BiLSTM for raw EEG signal MI classification.
 
-    Expects 4D input: (batch, eeg_channels, freq_bins, stft_times).
-    First conv collapses the frequency dimension entirely.
+    Expects 3D input: (batch, eeg_channels, time_samples).
+    Temporal convolutions extract local features, then BiLSTM
+    models temporal dependencies.
 
     Args:
         in_channels: Number of EEG channels.
-        freq_bins: Number of frequency bins in STFT.
         num_classes: Number of MI classes.
         hidden_dim: Hidden dimension for CNN and RNN.
-        rnn_layers: Number or BiLSTM layers.
+        rnn_layers: Number of BiLSTM layers.
         dropout: Dropout rate.
+        pool_factor: Temporal downsampling factor before LSTM.
+        se_reduction: SE block channel reduction ratio.
     """
     def __init__(
             self,
             in_channels: int = 22,
-            freq_bins: int = 33,
-            hidden_dim: int = 64,
             num_classes: int = 5,
+            hidden_dim: int = 64,
             rnn_layers: int = 2,
             dropout: float = 0.5,
+            pool_factor: int = 8,
             se_reduction: int = 4
     ):
         super().__init__()
 
-        # CNN: collapse frequency, project channels to hidden_dim features
-        self.conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=(freq_bins, 1))
-        self.bn = nn.BatchNorm2d(hidden_dim)
+        # Temporal feature extraction
+        # kernel_size=25 at 250Hz ~ 100ms receptive field
+        self.conv1 = nn.Conv1d(in_channels, hidden_dim, kernel_size=25, padding=12)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=13, padding=6)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
-        self.se = SEBlock(hidden_dim, reduction=se_reduction)
+        self.se = SE1DBlock(hidden_dim, reduction=se_reduction)
+
+        # Temporal downsampling before LSTM
+        self.pool = nn.AvgPool1d(kernel_size=pool_factor, stride=pool_factor)
 
         # BiLSTM: temporal modeling
         self.rnn = nn.LSTM(
@@ -79,24 +87,32 @@ class STFT_CNN_BiLSTM(nn.Module):
         """Instantiate from an experiment ConfigDict."""
         return cls(
             in_channels=cfg.eeg.in_channels,
-            freq_bins=cfg.preprocessing.stft_nperseg // 2 + 1,
             num_classes=cfg.eeg.num_classes,
             hidden_dim=cfg.model.hidden_dim,
             rnn_layers=cfg.model.rnn_layers,
             dropout=cfg.model.dropout,
+            pool_factor=cfg.model.pool_factor,
             se_reduction=cfg.model.se_reduction,
         )
 
     def forward(self, x):
-        # x: (B, C, F, T)
-        x = self.conv(x)  # (B, H, 1, T)
-        x = self.bn(x)
+        # x: (B, C, T)  e.g. (B, 22, 750)
+        x = self.conv1(x)  # (B, H, T)
+        x = self.bn1(x)
         x = F.elu(x)
         x = self.dropout(x)
-        x = self.se(x)  # (B, H, 1, T)
-        x = x.squeeze(2).permute(0, 2, 1)  # (B, T, H)
 
-        x, _ = self.rnn(x)  # (B, T, 2H)
+        x = self.conv2(x)  # (B, H, T)
+        x = self.bn2(x)
+        x = F.elu(x)
+        x = self.dropout(x)
+
+        x = self.se(x)  # (B, H, T)
+
+        x = self.pool(x)  # (B, H, T // pool_factor)
+        x = x.permute(0, 2, 1)  # (B, T // pool_factor, H)
+
+        x, _ = self.rnn(x)  # (B, T // pool_factor, 2H)
         x = x.mean(dim=1)  # (B, 2H) - global average pooling
 
         logits = self.fc(x)  # (B, num_classes)
@@ -104,17 +120,18 @@ class STFT_CNN_BiLSTM(nn.Module):
 
 
 if __name__ == "__main__":
-    model = STFT_CNN_BiLSTM(
+    # 3 seconds at 250 Hz = 750 samples
+    model = Raw_CNN_BiLSTM(
         in_channels=22,
-        freq_bins=33,
         num_classes=5,
         hidden_dim=64,
         rnn_layers=2,
         dropout=0.5,
+        pool_factor=8,
         se_reduction=4,
     )
 
-    x = torch.randn(16, 22, 33, 48)
+    x = torch.randn(16, 22, 750)
     out = model(x)
     print(f"Input: {x.shape}")
     print(f"Output: {out.shape}")
