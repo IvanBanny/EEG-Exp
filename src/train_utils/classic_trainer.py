@@ -6,6 +6,9 @@ from .utils import EarlyStopping, CheckpointManager
 from collections import defaultdict
 from datetime import datetime
 import json
+import shutil
+import tempfile
+from typing import Callable, Optional
 import numpy as np
 import torch
 import torch.nn as nn
@@ -42,7 +45,8 @@ def _flatten_config(cfg_dict):
 
 class ClassicTrainer:
     def __init__(self, model, criterion, optimizer, train_transform,
-                 val_transform, scheduler=None, device="cpu", cfg=None):
+                 val_transform, scheduler=None, device="cpu", cfg=None,
+                 sweep_mode: bool = False):
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
@@ -51,9 +55,14 @@ class ClassicTrainer:
         self.scheduler = scheduler
         self.device = device
         self.cfg = cfg
+        self.sweep_mode = sweep_mode
 
         self.history = defaultdict(list)
         self.global_step = 0
+
+        if sweep_mode:
+            self.writer = None
+            return
 
         if cfg is not None:
             stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -91,27 +100,38 @@ class ClassicTrainer:
         return val_loss, val_acc
 
     # Define training loop
-    def train_loop(self, train_set, val_set=None, lr_schedule=None):
+    def train_loop(self, train_set, val_set=None, lr_schedule=None,
+                   epoch_callback: Optional[Callable[[int, dict], None]] = None):
         # Wrap with appropriate transform
+        nw = self.cfg.data.num_workers
+        loader_kwargs = dict(
+            num_workers=nw, collate_fn=collate_eeg,
+            pin_memory=torch.cuda.is_available(),
+        )
+        if nw > 0:
+            # persistent_workers + prefetch keeps augmentation pipeline warm
+            # between epochs and hides per-batch CPU stalls
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 4
         train_set = TransformWrapper(train_set, self.train_transform)
         train_loader = DataLoader(
             train_set, batch_size=self.cfg.training.batch_size, shuffle=True,
-            num_workers=self.cfg.data.num_workers, collate_fn=collate_eeg,
-            pin_memory=torch.cuda.is_available()
+            **loader_kwargs,
         )
 
         if val_set is not None:
             val_wrapped = TransformWrapper(val_set, self.val_transform)
             val_loader = DataLoader(
                 val_wrapped, batch_size=self.cfg.training.batch_size, shuffle=False,
-                num_workers=self.cfg.data.num_workers, collate_fn=collate_eeg,
-                pin_memory=torch.cuda.is_available()
+                **loader_kwargs,
             )
 
         early_stopper = EarlyStopping(self.cfg.training.es_patience, self.cfg.training.es_min_delta)
+        # Sweep trials use a tempdir so trial checkpoints never pollute checkpoints/
+        ckpt_dir = tempfile.mkdtemp(prefix="sweep_ckpt_") if self.sweep_mode else "checkpoints"
         checkpoint_mgr = CheckpointManager(
             self.cfg.training.rollback_patience, self.cfg.training.rollback_min_delta,
-            self.cfg.training.rollback_on_disk, "checkpoints",
+            self.cfg.training.rollback_on_disk, ckpt_dir,
             self.cfg.model.checkpoint_name
         )
 
@@ -162,9 +182,10 @@ class ClassicTrainer:
             self.history["train_loss"].append(train_loss)
             self.history["train_acc"].append(train_acc)
 
-            self.writer.add_scalar("loss/train", train_loss, self.global_step)
-            self.writer.add_scalar("acc/train", train_acc, self.global_step)
-            self.writer.add_scalar("lr", self.optimizer.param_groups[0]["lr"], self.global_step)
+            if self.writer is not None:
+                self.writer.add_scalar("loss/train", train_loss, self.global_step)
+                self.writer.add_scalar("acc/train", train_acc, self.global_step)
+                self.writer.add_scalar("lr", self.optimizer.param_groups[0]["lr"], self.global_step)
 
             # Validation
             if val_set is not None:
@@ -174,8 +195,16 @@ class ClassicTrainer:
                 self.history["val_loss"].append(val_loss)
                 self.history["val_acc"].append(val_acc)
 
-                self.writer.add_scalar("loss/val", val_loss, self.global_step)
-                self.writer.add_scalar("acc/val", val_acc, self.global_step)
+                if self.writer is not None:
+                    self.writer.add_scalar("loss/val", val_loss, self.global_step)
+                    self.writer.add_scalar("acc/val", val_acc, self.global_step)
+
+                if epoch_callback is not None:
+                    # callback may raise (e.g. optuna.TrialPruned), let it propagate
+                    epoch_callback(true_epoch, {
+                        "val_loss": val_loss, "val_acc": val_acc,
+                        "train_loss": train_loss, "train_acc": train_acc,
+                    })
 
                 # Early stopping check
                 if early_stopper(val_loss):
@@ -225,22 +254,27 @@ class ClassicTrainer:
 
             self.global_step += 1
 
-        checkpoint_mgr.save_best(self.cfg)  # Save best model + config to /checkpoints
-        checkpoint_mgr.cleanup()  # Cleanup the rollback checkpoint if on disk
+        if self.sweep_mode:
+            checkpoint_mgr.cleanup()
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
+        else:
+            checkpoint_mgr.save_best(self.cfg)  # Save best model + config to /checkpoints
+            checkpoint_mgr.cleanup()  # Cleanup the rollback checkpoint if on disk
 
-        # Log hparams with best metrics (TB "HParams" tab - comparison across runs)
         best_epoch_idx = np.argmin(self.history["val_loss"])\
             if len(self.history["val_loss"]) else len(self.history["lr"]) - 1
-        if self.cfg is not None and len(self.history["val_loss"]):
-            self.writer.add_hparams(
-                _flatten_config(self.cfg.to_dict()),
-                {
-                    "hparam/best_val_loss": self.history["val_loss"][best_epoch_idx],
-                    "hparam/best_val_acc": self.history["val_acc"][best_epoch_idx],
-                },
-                run_name=".",
-            )
-        self.writer.close()
+        if self.writer is not None:
+            # Log hparams with best metrics (TB "HParams" tab - comparison across runs)
+            if self.cfg is not None and len(self.history["val_loss"]):
+                self.writer.add_hparams(
+                    _flatten_config(self.cfg.to_dict()),
+                    {
+                        "hparam/best_val_loss": self.history["val_loss"][best_epoch_idx],
+                        "hparam/best_val_acc": self.history["val_acc"][best_epoch_idx],
+                    },
+                    run_name=".",
+                )
+            self.writer.close()
 
         print("\nTraining Complete!\n")
 

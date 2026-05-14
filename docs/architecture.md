@@ -43,6 +43,8 @@ def get_config():
 
 All models implement `from_config(cls, cfg)` classmethod. Registered in `_MODEL_REGISTRY` in `src/models/__init__.py`. `build_model(cfg, device)` returns `(model, criterion, optimizer, scheduler)`.
 
+Current registry keys: `stft_cnn_bilstm`, `raw_cnn_bilstm`, `stft_resnet18`, `raw_resnet18`, `raw_conformer`, `eegnet`.
+
 ### STFT_CNN_BiLSTM (`src/models/CRNN.py`)
 
 Input: `(B, 22, 33, T_stft)` - channels as "input channels" to Conv2d.

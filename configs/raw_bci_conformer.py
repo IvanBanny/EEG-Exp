@@ -6,6 +6,7 @@ def get_config():
     c = base_config()
 
     c.preprocessing.representation = "raw"
+    c.preprocessing.t_fork = (0.5, 5.5)  # tfork_study winner on bci2a
     c.data.dataset = "bnci2014001"
     c.eeg.num_classes = 4
 

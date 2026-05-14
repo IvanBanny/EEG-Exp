@@ -13,9 +13,16 @@ pip install -r requirements.txt
 
 # Train with a specific experiment
 python train.py --config stft_cnnbilstm
-python train.py --config raw_cnnbilstm
-python train.py --config stft_resnet18
+python train.py --config raw_bci_cnnbilstm
+python train.py --config raw_bci_eegnet
+
+# Hyperparameter sweep (Optuna + ASHA pruning)
+python sweep.py --sweep raw_bci_cnnbilstm_sweep --trials 100
+python sweep.py --sweep raw_bci_cnnbilstm_sweep --smoke           # 2 trials x 3 epochs plumbing check
+python train.py --config raw_bci_cnnbilstm__best__raw_bci_cnnbilstm_sweep
 ```
+
+See [docs/sweeps.md](docs/sweeps.md) for the sweep framework reference.
 
 ## Monitoring with TensorBoard
 
@@ -29,12 +36,18 @@ Then open http://localhost:6006. Use the "HParams" tab to compare runs across co
 
 ## Available Experiments
 
-| Config | Model | Representation | Params | Notes |
-|---|---|---|---|---|
-| `stft_cnnbilstm` | CNN-BiLSTM | STFT | ~215K | Conv2d collapses freq, SE block, BiLSTM |
-| `raw_cnnbilstm` | CNN-BiLSTM | Raw | ~257K | Two Conv1d layers, SE, temporal pooling, BiLSTM |
-| `stft_resnet18` | ResNet-18 + SE | STFT | ~11.3M | Full ResNet-18 with SE in every residual block |
-| `stft_conformer` | Conformer | STFT | - | **WIP, not functional** |
+Experiments come in two flavors: `*` runs on Our5Class, `*_bci_*` runs on BNCI2014001 (BCI IV 2a).
+
+| Config family | Model | Representation | Notes |
+|---|---|---|---|
+| `stft_cnnbilstm`, `stft_bci_cnnbilstm` | CNN-BiLSTM | STFT | Conv2d collapses freq, SE block, BiLSTM (~215K) |
+| `raw_cnnbilstm`, `raw_bci_cnnbilstm` | CNN-BiLSTM | Raw | Two Conv1d + SE + temporal pooling + BiLSTM (~257K) |
+| `stft_resnet18`, `stft_bci_resnet18` | ResNet-18 + SE | STFT | Full ResNet-18 with SE in every residual block (~11.3M) |
+| `raw_resnet18`, `raw_bci_resnet18` | 1D ResNet-18 + SE | Raw | Conv1d ResNet variant |
+| `raw_conformer`, `raw_bci_conformer` | Conformer | Raw | Convolutional + self-attention encoder |
+| `raw_eegnet`, `raw_bci_eegnet` | EEGNet | Raw | Compact depthwise-separable baseline |
+
+Configs ending in `__best__<study>` are auto-generated winners from a sweep (see [docs/sweeps.md](docs/sweeps.md)).
 
 ## Datasets
 
@@ -64,16 +77,29 @@ All preprocessed data is cached to `moabb_cache/` after the first run.
 3. If new dataset: add builder in `src/loaders/factory.py`
 4. Run `python train.py --config your_experiment`
 
-See [docs/architecture.md](docs/architecture.md) for details on configs, models, and the training loop.
+## Adding a New Sweep
+
+1. Create `sweeps/your_sweep.py` exporting `BASE_CONFIG`, `METRIC`, `DIRECTION`, `MAX_EPOCHS`, and `define_space(trial) -> dict` of dotted-path overrides.
+2. Sweeps are forbidden from overriding `data.*` and `preprocessing.*` (datasets are built once outside the trial loop).
+3. Run `python sweep.py --sweep your_sweep --trials 100`.
+4. After the study, `sweep.py` writes `configs/<base>__best__<study>.py` so you can retrain the winner at full budget via `python train.py --config <base>__best__<study>`.
+
+See [docs/architecture.md](docs/architecture.md) for configs, models, and the training loop, and [docs/sweeps.md](docs/sweeps.md) for the sweep framework.
 
 ## Project Structure
 
 ```
 ivansnet/
-├── train.py                    # CLI entry point
+├── train.py                    # Training entry point
+├── sweep.py                    # Optuna sweep entry point
 ├── configs/
 │   ├── base.py                 # Shared defaults (base_config())
-│   └── stft_cnnbilstm.py ...   # Per-experiment overrides
+│   ├── {raw,stft}_{model}.py            # Our5Class experiments
+│   ├── {raw,stft}_bci_{model}.py        # BNCI2014001 experiments
+│   └── *__best__*.py                    # Auto-generated sweep winners
+├── sweeps/
+│   ├── <name>_sweep.py         # Search-space definitions
+│   └── .studies/               # SQLite study files (auto-created)
 ├── src/
 │   ├── data_proc/              # Poly5 reader, MOABB dataset wrapper, signal ops
 │   ├── loaders/                # PyTorch datasets, transforms, augmentations, factory
@@ -104,9 +130,9 @@ ivansnet/
 Reduce memory by adjusting these config values:
 ```python
 config.preprocessing.window_overlap: 0.9 -> 0.8   # fewer windows
-config.preprocessing.window_sec: 3.0 -> 4.0        # fewer windows
-config.preprocessing.stft_nperseg: 64 -> 128        # fewer STFT time steps
-config.preprocessing.use_cache: True -> False        # don't cache to disk
+config.preprocessing.window_sec: 3.0 -> 4.0       # fewer windows
+config.preprocessing.stft_nperseg: 64 -> 128      # fewer STFT time steps
+config.preprocessing.use_cache: True -> False     # don't cache to disk
 ```
 
 ## Known Issues
