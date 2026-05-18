@@ -1,168 +1,198 @@
-# Architecture Reference
+# Architecture reference
 
-Reference for the config system, models, data pipeline, and training loop.
+Config system, models, data pipeline, training loop. Companion to
+`data.md` (datasets and preprocessing) and `sweeps.md` (Optuna).
 
----
+## Config system
 
-## Config System
-
-All configs use `ml_collections.ConfigDict`.
-
-**Pattern**: experiment config calls `base_config()` from `configs/base.py`, overrides fields, adds `model.*` params, calls `.lock()`. Must export `get_config()`.
+All configs use `ml_collections.ConfigDict`. An experiment config calls
+`base_config()` from `configs/base.py`, overrides what it needs, adds
+`model.*` params, then `.lock()`s. It must export `get_config()`.
 
 ```python
 # configs/my_experiment.py
-from configs.base import base_config
+from .base import base_config
+
 
 def get_config():
     cfg = base_config()
-    cfg.model.arch = "stft_cnn_bilstm"
-    cfg.model.checkpoint_name = "My_Experiment_v1"
-    cfg.model.hidden_dim = 64
-    # ...
+    with cfg.unlocked():
+        cfg.model.arch = "eegencoder"
+        cfg.model.checkpoint_name = "my_experiment"
+        cfg.model.f1 = 16
+        # ...
     cfg.lock()
     return cfg
 ```
 
-`train.py` loads configs dynamically: `importlib.import_module(f"configs.{args.config}")`.
+`train.py`, `train_subjects.py`, and `sweep.py` load configs
+dynamically: `importlib.import_module(f"configs.{args.config}")`.
 
-### Key Config Groups
+### Config groups
 
 | Group | Key fields |
 |---|---|
-| `eeg` | `in_channels` (22), `num_classes` (5) |
-| `preprocessing` | `representation` ("stft"/"raw"), `resample_rate` (250), `freq_fork` (4,40), `t_fork` (0,6), `window_sec` (3.0), `window_overlap` (0.9), `stft_nperseg` (64), `stft_overlap` (48), `use_cache`, `cache_path` |
-| `regularization` | `clip_sigma` (4.0), `gaussian_std` (0.15), `scale_fork` (0.8,1.2), `max_shift` (10), `channel_dropout` (0.2) |
-| `data` | `dataset` ("our5class"/"bnci2014001"), `data_path`, `num_workers` (8) |
-| `model` | `arch` (selects from registry), `checkpoint_name`, + arch-specific params |
-| `training` | `optimizer`, `loss_function`, `label_smoothing` (0.2), `batch_size` (64), `epochs` (1000), `lr` (3e-4), `weight_decay` (0.1), `gradient_clip_norm` (2.0), `es_patience` (48), `rollback_patience` (16), `lr_patience` (16), `lr_factor` (0.5), `min_lr` (1e-7) |
+| `eeg` | `in_channels` (22), `num_classes` (5 for Our5, 4 for BCI 2a) |
+| `preprocessing` | `representation` (`raw` / `stft`), `resample_rate` (250), `freq_fork` (4, 40), `t_fork`, `window_sec` (2.0), `window_overlap` (0.95), `stft_nperseg` (64), `stft_overlap` (48), `normalize` (`per_subject` / `per_channel` / `per_window`), `use_cache`, `cache_path` |
+| `regularization` | `clip_sigma` (5.0), `gaussian_std` (0.0), `scale_fork` (1.0, 1.0), `max_shift` (0), `channel_dropout` (0.0), `mixup_alpha` (0.0) |
+| `data` | `dataset` (`our5class` / `our4class` / `bnci2014001`), `data_path`, `split_mode`, `subjects` (optional), `num_workers` |
+| `model` | `arch` (registry key), `checkpoint_name`, + arch-specific params |
+| `training` | `optimizer`, `loss_function`, `label_smoothing` (0.1), `batch_size` (64), `epochs` (200), `num_runs`, `lr` (1e-3), `weight_decay` (0.0), `gradient_clip_norm` (2.0), `es_patience` (32), `rollback_patience` (16), `lr_patience` (16), `lr_factor` (0.5), `min_lr` (1e-7) |
 
----
+Defaults are set by `base_config()`. The six winner configs re-state
+every field they depend on, so the headline kappa does not silently
+shift if `base_config()` changes.
+
+`cfg.preprocessing.t_fork` is measured from MOABB's natural anchor:
+trial start for Our5Class (`interval[0] = 0`) and cue onset for
+BNCI2014_001 (`interval[0] = 2`). The cue-relative `t_fork` convention
+is documented in `src/loaders/factory.py:_paradigm`.
 
 ## Models
 
-All models implement `from_config(cls, cfg)` classmethod. Registered in `_MODEL_REGISTRY` in `src/models/__init__.py`. `build_model(cfg, device)` returns `(model, criterion, optimizer, scheduler)`.
+All models implement `from_config(cls, cfg)`. Registered in
+`_MODEL_REGISTRY` in `src/models/__init__.py`. `build_model(cfg, device)`
+returns `(model, criterion, optimizer, scheduler)`.
 
-Current registry keys: `stft_cnn_bilstm`, `raw_cnn_bilstm`, `stft_resnet18`, `raw_resnet18`, `raw_conformer`, `eegnet`.
+| Key | File | Notes |
+|---|---|---|
+| `eegencoder` | `EEGEncoder.py` | n=5 parallel DSTS branches, ~175 k params |
+| `eegnet` | `EEGNet.py` | EEGNet-8,2; ~3 k params |
+| `raw_cnn_bilstm` | `RawCRNN.py` | Conv1d + SE + temporal pool + BiLSTM, ~257 k params |
+| `raw_resnet18` | `RawResNet18.py` | 1D ResNet-18 + SE |
+| `raw_conformer` | `RawConformer.py` | EEG-Conformer (conv tokens + transformer) |
+| `stft_cnn_bilstm` | `CRNN.py` | STFT analogue of the CNN-BiLSTM, ~215 k params |
+| `stft_resnet18` | `ResNet18.py` | 2D ResNet-18 + SE on spectrograms, ~11.3 M params |
 
-### STFT_CNN_BiLSTM (`src/models/CRNN.py`)
+### EEGEncoder (`src/models/EEGEncoder.py`, `_blocks.py`)
 
-Input: `(B, 22, 33, T_stft)` - channels as "input channels" to Conv2d.
+Input `(B, C, T)` raw.
 
 ```
-Conv2d(22, hidden, kernel=(freq_bins, 1))   # collapse entire freq dim
--> BN -> ELU -> Dropout
--> SEBlock2D(hidden, reduction)             # channel attention
--> squeeze freq dim, permute to (B, T, hidden)
--> BiLSTM(hidden, hidden, layers=2, dropout)
--> mean over time -> (B, 2*hidden)
--> Linear(2*hidden, num_classes)
+DownsamplingProjector (3-stage Conv2d, EEGNet-style depthwise / separable
+    with two AvgPools)
+    -> n=5 parallel DSTS branches, each:
+        Dropout -> CausalTCN(last timestep) +
+                   StableTransformer(time-mean, 2 layers, 2 heads,
+                                     RMSNorm + SwiGLU + rotary + causal mask)
+        -> sum, per-branch Linear -> num_classes
+    -> average branch logits
 ```
 
-Config params: `hidden_dim=64`, `rnn_layers=2`, `dropout=0.5`, `se_reduction=4`.
+`_blocks.py` carries the reusable kernel (`RmsNorm`, `SwigluFfn`,
+`RotaryEmbedding`, `CausalSelfAttention`, `StableTransformerBlock`,
+`CausalTcn`).
+
+### EEGNet (`src/models/EEGNet.py`)
+
+Canonical EEGNet-8,2 (Lawhern et al.). Optional `endpool_ms` replaces
+the terminal flatten with an average over the most-recent `endpool_ms`
+of input - used by the BCI 2a `w=1 s` cell.
 
 ### Raw_CNN_BiLSTM (`src/models/RawCRNN.py`)
 
-Input: `(B, 22, 750)` - 3s at 250 Hz.
-
 ```
-Conv1d(22, hidden, k=25, pad=12)   # ~100ms receptive field
--> BN -> ELU -> Dropout
--> Conv1d(hidden, hidden, k=13, pad=6)
--> BN -> ELU -> Dropout
--> SE1DBlock(hidden, reduction)
--> AvgPool1d(pool_factor)          # 750 -> ~94 steps
--> permute to (B, T//pool, hidden)
--> BiLSTM(hidden, hidden, layers=2, dropout)
--> mean over time -> (B, 2*hidden)
--> Linear(2*hidden, num_classes)
+Conv1d(C, hidden, k=25, pad=12)         # ~100 ms RF
+    -> BN -> ELU -> Dropout
+    -> Conv1d(hidden, hidden, k=13, pad=6)
+    -> BN -> ELU -> Dropout
+    -> SE1DBlock(hidden, reduction)
+    -> AvgPool1d(pool_factor)
+    -> permute -> BiLSTM(hidden, layers, dropout)
+    -> mean over time (or last step if causal) -> Linear -> num_classes
 ```
 
-Config params: same as STFT variant + `pool_factor=8`.
+Config: `hidden_dim`, `rnn_layers`, `dropout`, `pool_factor`,
+`se_reduction`, `causal`.
 
-### STFT_ResNet18 (`src/models/ResNet18.py`)
+### Other models
 
-Input: `(B, 22, H, W)` - any STFT shape.
+`Raw_ResNet18` is the 1D analogue of the STFT ResNet-18.
+`Raw_Conformer` is the convolutional + self-attention encoder
+(Song et al., 2023). `STFT_CNN_BiLSTM` and `STFT_ResNet18` cover the
+spectrogram pipeline - no current winner config uses them, but both
+stay registered as canonical STFT baselines.
+
+## Data pipeline
 
 ```
-Stem: Conv2d(22, 64, k=7, s=2, p=3) -> BN -> SiLU -> MaxPool
-4 layers: [64->64, 64->128, 128->256, 256->512] x 2 ResidualBlocks each
-  ResidualBlock: Conv->BN->SiLU->Conv->BN->SEBlock(reduction=16)->add->SiLU
-AdaptiveAvgPool2d(1,1) -> Dropout -> Linear(512, num_classes)
+Raw recordings (Poly5 1000 Hz, 22ch + marker CSVs;
+                or MOABB BNCI2014_001)
+    -> MOABB MotorImagery paradigm
+       (bandpass freq_fork, resample to resample_rate, epoch around t_fork)
+    -> Sliding window (window_sec s, window_overlap fraction)
+    -> [stft] scipy.signal.stft magnitude (nperseg=64, noverlap=48)
+              -> (n_windows, C, 33, 48)
+    -> [raw]  windowed signal
+              -> (n_windows, C, window_samples)
+    -> ClipOutliers -> [LogCompress for stft]
+    -> per-subject normalizer (fit on train split,
+       applied at sample-fetch via TransformWrapper)
+    -> augmentation (only if non-zero knobs; train-only)
+    -> DataLoader (persistent_workers, prefetch_factor=4)
 ```
 
-Config params: `dropout=0.5`. SE reduction hardcoded to 16. Kaiming init. ~11.3M params.
+`src/loaders/factory.py:cache_tag(cfg)` builds a deterministic tag
+from every preprocessing key that affects cached arrays (`t_fork`,
+`window_sec`, `window_overlap`, `freq_fork`, `split_mode`). Two
+configs that differ on any of those never collide.
 
----
-
-## Data Pipeline Details
-
-### MOABB Integration (`src/data_proc/signal_ops.py`)
-
-The sliding window and STFT are injected into MOABB's internal sklearn pipeline at the `ARRAY` stage, before caching. This means cached arrays already contain fully preprocessed windows - no recomputation on subsequent runs.
-
-`inject_array_transforms()` locates MOABB's `ForkPipelines` and appends `FunctionTransformer` steps to both the X and events branches. Labels are expanded by repeating each label `windows_per_trial` times.
-
-### Shapes After Preprocessing
+Per-window shapes for the defaults (`window_sec = 2.0`,
+`resample_rate = 250`, `stft_nperseg = 64`):
 
 | Representation | Shape | Breakdown |
 |---|---|---|
-| STFT | `(N, 22, 33, 48)` | N windows, 22 channels, 33 freq bins, 48 STFT time steps |
-| Raw | `(N, 22, 750)` | N windows, 22 channels, 750 samples (3s x 250Hz) |
+| stft | `(N, 22, 33, ~13)` | 33 freq bins, T_stft depends on window |
+| raw | `(N, 22, 500)` | 22 channels, 500 samples (2 s x 250 Hz) |
 
-`freq_bins = stft_nperseg // 2 + 1 = 33`. Windows per trial with default params: 21 (3s window, 90% overlap, 6s trial at 250Hz).
+## Training loop (`src/train_utils/classic_trainer.py`)
 
-### Our5Class Dataset (`src/data_proc/our_5_class.py`)
+Per epoch:
 
-MOABB-compatible wrapper. Per-run preprocessing: set montage (standard_1020), pick 22 EEG + M1/M2, re-reference to M1/M2 average, drop references, add annotations from CSV markers.
+1. Forward pass -> CrossEntropyLoss (with label smoothing) -> backward.
+2. `clip_grad_norm_(max_norm)` -> optimizer step.
+3. Log train scalars to TB (`runs/<checkpoint_name>/...`).
+4. Validation pass (if a val set was provided).
+5. `EarlyStopping(patience)` on val_loss; raises stop when exhausted.
+6. `ReduceLROnPlateau(factor, patience, min_lr)` steps on val_loss.
+7. `CheckpointManager(rollback_patience)` rolls model weights back to
+   the best-val-loss state when patience expires. The current LR is
+   preserved (the scheduler may have reduced it in the meantime).
 
-Train/val split: controlled by `get_last_trials_xor` flag. `False` = all runs except last (train), `True` = last run only (val). Factory creates two separate dataset instances.
+### Sweep mode
 
-### Transforms (`src/loaders/transforms.py`)
+`sweep_mode=True` writes nothing to disk except a tempdir cleaned up
+after the trial. No TB, no persistent checkpoints, no `add_hparams`.
+Used by `sweep.py`.
 
-Applied at DataLoader time via `TransformWrapper`, not at dataset init.
+### Prediction dump
 
-| Transform | What it does | Dim behavior |
-|---|---|---|
-| `ClipOutliers(sigma)` | Clamp to mean +/- sigma*std | Per last-dim slice |
-| `LogCompress` | `log1p(x)` | Elementwise, STFT only |
-| `ZScoreNormalize` | `(x - mean) / std` | Global (single scalar mean/std per sample) |
-
-### Augmentations (`src/loaders/augmentation.py`)
-
-Train only. Applied after transforms.
-
-| Augmentation | What it does |
-|---|---|
-| `GaussianNoise(std)` | Additive N(0, std) noise |
-| `RandomScale(lo, hi)` | Per-channel uniform scale factor |
-| `TimeShift(max_shift)` | Circular roll on last axis, random offset |
-| `ChannelDropout(p)` | Zero out each channel independently with prob p |
-
----
-
-## Training Loop (`src/train_utils/classic_trainer.py`)
-
-### Per Epoch
-
-1. Forward pass -> CrossEntropyLoss (with label smoothing) -> backward
-2. `clip_grad_norm_(max_norm)` -> optimizer step
-3. Log train loss/acc to TensorBoard (`runs/{checkpoint_name}`) and in-memory history
-4. Validation pass (if val set provided)
-5. `EarlyStopping` checks val_loss (patience=48)
-6. `ReduceLROnPlateau` steps on val_loss (factor=0.5, patience=16, min_lr=1e-7)
-7. `CheckpointManager` rollback check (patience=16)
-
-### Rollback Mechanism
-
-`CheckpointManager` saves best model+optimizer state in memory (or on disk). When val_loss fails to improve for `rollback_patience` epochs, it restores the best state. Key detail: current LR is preserved across rollback (not rewound), since the scheduler may have reduced it.
-
-After rollback, history is also rewound, so `true_epoch` (used for TensorBoard x-axis) resets accordingly.
+Setting `dump_predictions_path` writes a single `predictions.npz`
+after training: per-window val logits, labels, per-window metadata
+(`subject_ids`, `windows_per_trial`, `sfreq`, ...). `train_subjects.py`
+always sets this; `src/eval/aggregate.py` consumes it.
 
 ### Output
 
-Best model saved to `checkpoints/{checkpoint_name}/best.pt` (state dict) + `best.yaml` (config). Training history saved as `best.csv`.
+- Standard mode - best `model.pt` + config `yaml` in
+  `checkpoints/<checkpoint_name>/`; TB scalars under
+  `runs/<checkpoint_name>/<dataset>_<ts>/`.
+- Per-subject - per-cell layout under `runs/<config>/subject_<N>/seed_<S>/`
+  (events + predictions.npz + result.json) plus
+  `checkpoints/<config>/subject_<N>/seed_<S>/best.pt`.
+- Pooled multi-seed - one TB run per seed under
+  `runs/<config>/<dataset>_<ts>_avg<N>/seed_<seed>/`, with a sibling
+  `_agg/` carrying mean / std / `n_active` curves and the mean
+  confusion matrix.
 
-### EarlyStopping
+## Build helpers
 
-Fires when `counter > patience` (not `>=`), so actual tolerance is `patience + 1` epochs without improvement.
+- `src/loaders/build_datasets(cfg) -> (train_ds, val_ds, normalizer)`.
+- `src/train_utils/build_transforms(cfg, normalizer) -> (train_t, val_t)`.
+  Zero-knob augmentations are dropped (not no-op'd), so they consume
+  no RNG state.
+- `src/models/build_model(cfg, device) -> (model, criterion, optimizer,
+  scheduler)`.
+- `src/eval/aggregate.aggregate(runs_dir) -> DataFrame`. Walks per-cell
+  `result.json` siblings of `predictions.npz` and computes per-window
+  and per-action metrics.

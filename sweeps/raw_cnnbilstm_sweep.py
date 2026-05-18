@@ -1,6 +1,10 @@
-"""Raw CNN-BiLSTM hyperparameter sweep on Our5Class."""
+"""Raw CNN-BiLSTM hyperparameter sweep on Our5Class.
 
-BASE_CONFIG = "raw_cnnbilstm"
+Starts from the winner config and overrides the HPs in `define_space`.
+Run via `python sweep.py --sweep raw_cnnbilstm_sweep --trials 100`.
+"""
+
+BASE_CONFIG = "raw_our5_cnnbilstm__winner_live"
 METRIC = "val_acc"
 DIRECTION = "maximize"
 MAX_EPOCHS = 80

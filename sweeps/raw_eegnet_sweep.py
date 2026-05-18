@@ -1,6 +1,10 @@
-"""EEGNet hyperparameter sweep on Our5Class."""
+"""EEGNet hyperparameter sweep on Our5Class.
 
-BASE_CONFIG = "raw_eegnet"
+Starts from the winner config and overrides the HPs in `define_space`.
+Run via `python sweep.py --sweep raw_eegnet_sweep --trials 100`.
+"""
+
+BASE_CONFIG = "raw_our5_eegnet__winner_live"
 METRIC = "val_acc"
 DIRECTION = "maximize"
 MAX_EPOCHS = 80

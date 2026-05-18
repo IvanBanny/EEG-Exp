@@ -29,20 +29,28 @@ class SE1DBlock(nn.Module):
 
 
 class Raw_CNN_BiLSTM(nn.Module):
-    """1D CNN + BiLSTM for raw EEG signal MI classification.
+    """1D CNN + (Bi)LSTM for raw EEG signal MI classification.
 
     Expects 3D input: (batch, eeg_channels, time_samples).
-    Temporal convolutions extract local features, then BiLSTM
-    models temporal dependencies.
+    Temporal convolutions extract local features, then an LSTM models temporal
+    dependencies.
+
+    The `causal` flag switches between the offline-benchmark default (BiLSTM
+    with global-mean pooling) and the deployment-honest variant (unidirectional
+    LSTM with last-hidden-state read-out). Causal mode classifies based on the
+    end of the input window only - matching live streaming inference where the
+    future is unknown.
 
     Args:
         in_channels: Number of EEG channels.
         num_classes: Number of MI classes.
         hidden_dim: Hidden dimension for CNN and RNN.
-        rnn_layers: Number of BiLSTM layers.
+        rnn_layers: Number of LSTM layers.
         dropout: Dropout rate.
         pool_factor: Temporal downsampling factor before LSTM.
         se_reduction: SE block channel reduction ratio.
+        causal: If True, use a unidirectional LSTM and read off only the last
+            timestep. If False (default), use a BiLSTM with mean pooling.
     """
     def __init__(
             self,
@@ -52,9 +60,11 @@ class Raw_CNN_BiLSTM(nn.Module):
             rnn_layers: int = 2,
             dropout: float = 0.5,
             pool_factor: int = 8,
-            se_reduction: int = 4
+            se_reduction: int = 4,
+            causal: bool = False,
     ):
         super().__init__()
+        self.causal = causal
 
         # Temporal feature extraction
         # kernel_size=25 at 250Hz ~ 100ms receptive field
@@ -69,18 +79,18 @@ class Raw_CNN_BiLSTM(nn.Module):
         # Temporal downsampling before LSTM
         self.pool = nn.AvgPool1d(kernel_size=pool_factor, stride=pool_factor)
 
-        # BiLSTM: temporal modeling
         self.rnn = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=rnn_layers,
             batch_first=True,
-            bidirectional=True,
+            bidirectional=not causal,
             dropout=dropout if rnn_layers > 1 else 0
         )
 
-        # Classifier
-        self.fc = nn.Linear(hidden_dim * 2, num_classes)
+        # Classifier head: BiLSTM concatenates fwd+bwd, causal LSTM does not.
+        head_dim = hidden_dim * (1 if causal else 2)
+        self.fc = nn.Linear(head_dim, num_classes)
 
     @classmethod
     def from_config(cls, cfg):
@@ -93,6 +103,7 @@ class Raw_CNN_BiLSTM(nn.Module):
             dropout=cfg.model.dropout,
             pool_factor=cfg.model.pool_factor,
             se_reduction=cfg.model.se_reduction,
+            causal=cfg.model.get("causal", False),
         )
 
     def forward(self, x):
@@ -112,8 +123,10 @@ class Raw_CNN_BiLSTM(nn.Module):
         x = self.pool(x)  # (B, H, T // pool_factor)
         x = x.permute(0, 2, 1)  # (B, T // pool_factor, H)
 
-        x, _ = self.rnn(x)  # (B, T // pool_factor, 2H)
-        x = x.mean(dim=1)  # (B, 2H) - global average pooling
+        x, _ = self.rnn(x)
+        # Causal: classify on the last timestep only (deployment-honest).
+        # BiLSTM: global mean pool (offline default).
+        x = x[:, -1, :] if self.causal else x.mean(dim=1)
 
         logits = self.fc(x)  # (B, num_classes)
         return logits

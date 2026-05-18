@@ -8,6 +8,7 @@ from .ResNet18 import STFT_ResNet18
 from .RawResNet18 import Raw_ResNet18
 from .RawConformer import Raw_Conformer
 from .EEGNet import EEGNet
+from .EEGEncoder import EEGEncoder
 
 _MODEL_REGISTRY = {
     "stft_cnn_bilstm": STFT_CNN_BiLSTM,
@@ -16,6 +17,7 @@ _MODEL_REGISTRY = {
     "raw_resnet18": Raw_ResNet18,
     "raw_conformer": Raw_Conformer,
     "eegnet": EEGNet,
+    "eegencoder": EEGEncoder,
 }
 
 

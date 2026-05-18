@@ -1,34 +1,9 @@
 """Torch Dataset wrapper for MOABB MI data.
 
-This module provides a Torch-compatible Dataset class that wraps any MOABB
-dataset and paradigm pipeline, enabling integration with Torch DataLoaders.
-Supports both STFT spectrogram and raw signal representations.
-
-Example:
-    from torch.utils.data import DataLoader
-    from moabb.datasets import BNCI2014_001
-    from moabb.paradigms import MotorImagery
-    from src.loaders import EEGDataset, EEGDatasetConfig
-
-    dataset = BNCI2014_001()
-    paradigm = MotorImagery(fmin=4, fmax=40, resample=250, tmin=0, tmax=4)
-
-    # STFT representation (default)
-    config = EEGDatasetConfig(
-        paradigm=paradigm,
-        window_sec=2.0,
-        window_overlap=0.9,
-    )
-    torch_dataset = EEGDataset(dataset, config)
-
-    # Raw signal representation
-    raw_config = EEGDatasetConfig(
-        paradigm=paradigm,
-        representation="raw",
-        window_sec=2.0,
-        window_overlap=0.9,
-    )
-    raw_dataset = EEGDataset(dataset, raw_config)
+Wraps any MOABB dataset + paradigm pipeline into a Torch Dataset.
+Supports both STFT spectrogram and raw signal representations; pulls
+all data into memory at construction so training-time `__getitem__` is
+just a tensor index.
 """
 
 import shutil
@@ -47,26 +22,23 @@ from ..data_proc import inject_sliding_window, inject_sliding_window_stft
 
 @dataclass
 class EEGDatasetConfig:
-    """Configuration for EEGDataset.
+    """Per-`EEGDataset` configuration.
 
-    Centralizes preprocessing and windowing parameters. The paradigm object
-    defines filtering, resampling, and epoch extraction. This config handles
-    the sliding window stage (and optionally STFT) and caching.
+    The paradigm covers filtering / resampling / epoching; this config
+    covers the sliding-window stage (and optional STFT) plus caching.
 
     Attributes:
-        paradigm: MOABB paradigm instance (e.g., MotorImagery). Defines fmin,
-            fmax, resample, tmin, tmax, events, etc.
-        representation: Signal representation - "stft" for spectrograms,
-            "raw" for windowed time-domain signal.
-        subjects: List of subject IDs to load. None means all subjects.
+        paradigm: MOABB paradigm instance (e.g. MotorImagery).
+        representation: "stft" for spectrograms, "raw" for windowed
+            time-domain signal.
+        subjects: List of subject IDs to load. None = all subjects.
         window_sec: Sliding window length in seconds.
         window_overlap: Window overlap ratio in [0.0, 0.99].
-        stft_nperseg: STFT segment length (only used when representation="stft").
-        stft_overlap: STFT segment overlap (only used when representation="stft").
-        use_cache: Whether to use MOABB's array caching.
-        regen_cache: If True, overwrite existing cached arrays. Useful when
-            preprocessing config changed since the last cached run.
-        cache_path: Path for MOABB cache. None disables caching.
+        stft_nperseg: STFT segment length (only for representation="stft").
+        stft_overlap: STFT segment overlap (only for representation="stft").
+        use_cache: Whether to use MOABB's array cache.
+        regen_cache: If True, overwrite existing cached arrays.
+        cache_path: Path for the MOABB cache. None disables caching.
         dtype: numpy dtype for data arrays.
     """
 
@@ -84,85 +56,53 @@ class EEGDatasetConfig:
 
     def __post_init__(self):
         if self.representation not in ("stft", "raw"):
-            raise ValueError(f"Unknown representation '{self.representation}', "
-                             f"must be 'stft' or 'raw'")
+            raise ValueError(
+                f"Unknown representation '{self.representation}', "
+                f"must be 'stft' or 'raw'"
+            )
 
     def get_n_times(self, dataset: BaseDataset) -> int:
-        """Compute number of time samples per epoch for a given dataset.
-
-        Uses the paradigm's tmin/tmax and resample settings along with
-        dataset-specific interval information.
-
-        Args:
-            dataset: MOABB dataset to compute n_times for.
-
-        Returns:
-            Number of time samples per epoch after resampling.
-        """
-        # Paradigm settings take precedence if set
+        """Time samples per epoch after resampling."""
         tmin = self.paradigm.tmin if self.paradigm.tmin is not None else dataset.interval[0]
         tmax = self.paradigm.tmax if self.paradigm.tmax is not None else dataset.interval[1]
         sfreq = self.paradigm.resample if self.paradigm.resample is not None else 250.0
-
-        duration = tmax - tmin
-        return int(duration * sfreq)
+        return int((tmax - tmin) * sfreq)
 
     def get_sfreq(self) -> float:
-        """Get the sampling frequency after paradigm resampling.
-
-        Returns:
-            Sampling frequency in Hz.
-
-        Raises:
-            ValueError: If paradigm.resample is not set.
-        """
+        """Sampling frequency after paradigm resampling."""
         if self.paradigm.resample is None:
             raise ValueError(
-                "paradigm.resample must be set for sliding window extraction. "
-                "The transform requires a known, fixed sampling rate."
+                "paradigm.resample must be set for sliding window "
+                "extraction; the transform requires a fixed sample rate."
             )
         return float(self.paradigm.resample)
-
-
-# Backward compat alias
-STFTDatasetConfig = EEGDatasetConfig
 
 
 class EEGDataset(Dataset):
     """Torch Dataset for Motor Imagery EEG data.
 
-    Wraps any MOABB dataset and paradigm pipeline to provide either windowed STFT
-    spectrograms or raw windowed signal as torch tensors. Data is loaded once at
-    initialization and stored in memory for fast access during training.
-
-    The class handles:
-        - Pipeline injection for sliding window (+ optional STFT)
-        - Label encoding (string -> integer)
-        - Conversion to torch tensors
+    Wraps any MOABB dataset + paradigm pipeline into either windowed
+    STFT spectrograms or raw windowed signal, materialised as torch
+    tensors at construction. Handles pipeline injection for the sliding
+    window (+ optional STFT), label encoding, and the tensor conversion.
 
     Attributes:
         config: Dataset configuration.
-        data: Preprocessed EEG data as tensor.
+        data: Preprocessed EEG tensor.
             STFT: (n_windows, n_channels, n_freqs, n_times).
-            Raw: (n_windows, n_channels, n_samples).
-        labels: Integer class labels as tensor (n_windows,).
+            Raw:  (n_windows, n_channels, n_samples).
+        labels: Integer class labels (n_windows,).
         metadata: Original MOABB metadata DataFrame.
-        label_map: Mapping from class names to integer indices.
-        window_config: Sliding window configuration used for preprocessing.
+        label_map: Class-name -> integer-index mapping.
+        window_config: Sliding-window configuration used at preprocessing.
     """
 
     def __init__(self, dataset: BaseDataset, config: EEGDatasetConfig) -> None:
-        """Initialize the dataset.
-
-        Loads and preprocesses all data according to the configuration.
-        This may take a while on first run without cache.
-
-        Args:
-            dataset: Any MOABB-compatible dataset instance.
-            config: Dataset configuration object.
-        """
         self.config = config
         self.moabb_dataset = dataset
+        # When True, __getitem__ returns (data, label, subject_id).
+        # The factory flips this on after fitting a per-subject normaliser.
+        self.return_subject_id = False
         self._load_data()
 
     def _load_data(self) -> None:
@@ -221,6 +161,9 @@ class EEGDataset(Dataset):
         self.data = torch.from_numpy(X.astype(self.config.dtype))
         self.labels = torch.from_numpy(encoded_labels)
         self.metadata = metadata
+        self.subject_ids = torch.from_numpy(
+            metadata["subject"].to_numpy().astype(np.int64)
+        )
 
     def _make_cache_config(self) -> dict:
         """Create MOABB cache configuration dictionary."""
@@ -242,18 +185,9 @@ class EEGDataset(Dataset):
         """Return the number of samples in the dataset."""
         return len(self.labels)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Get a single sample.
-
-        Args:
-            idx: Sample index.
-
-        Returns:
-            Tuple of (data, label) tensors.
-            STFT: data is (n_channels, n_freqs, n_times) spectrogram.
-            Raw: data is (n_channels, n_samples) signal.
-            label: Scalar integer class label.
-        """
+    def __getitem__(self, idx: int):
+        if self.return_subject_id:
+            return self.data[idx], self.labels[idx], int(self.subject_ids[idx])
         return self.data[idx], self.labels[idx]
 
     @property
@@ -359,30 +293,20 @@ class EEGDataset(Dataset):
         )
 
 
-# Backward compat alias
-STFTDataset = EEGDataset
-
-
 class SubsetEEGDataset(Dataset):
-    """A subset view of EEGDataset.
-
-    Provides a Dataset interface over a subset of indices from the parent
-    EEGDataset. Does not copy data, just indexes into the parent.
-
-    Attributes:
-        parent: The parent EEGDataset.
-        indices: Array of valid indices into the parent dataset.
-    """
+    """A subset view over an `EEGDataset` (no data copy)."""
 
     def __init__(self, parent: EEGDataset, indices: np.ndarray) -> None:
-        """Initialize subset dataset.
-
-        Args:
-            parent: Parent EEGDataset to take subset from.
-            indices: Array of indices to include in this subset.
-        """
         self.parent = parent
         self.indices = indices
+
+    @property
+    def return_subject_id(self) -> bool:
+        return self.parent.return_subject_id
+
+    @return_subject_id.setter
+    def return_subject_id(self, value: bool) -> None:
+        self.parent.return_subject_id = value
 
     def __len__(self) -> int:
         """Return the number of samples in the subset."""
@@ -434,7 +358,3 @@ class SubsetEEGDataset(Dataset):
         _, counts = torch.unique(self.labels, return_counts=True)
         weights = 1.0 / counts.float()
         return weights / weights.sum() * len(weights)
-
-
-# Backward compat alias
-SubsetSTFTDataset = SubsetEEGDataset

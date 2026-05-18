@@ -1,15 +1,4 @@
-"""Our 5-class MI dataset for MOABB.
-
-This module wraps our TMSi APEX 5-class MI dataset into a
-MOABB-compatible format for integration with other datasets.
-
-Example:
-    from data_proc import Our5Class
-    from moabb.paradigms import MotorImagery
-    dataset = Our5Class()
-    paradigm = MotorImagery(events=dataset.event_id, n_classes=5)
-    X, labels, meta = paradigm.get_data(datasets=dataset, subjects=[1])
-"""
+"""TMSi APEX 5-class MI dataset wrapped as a MOABB dataset."""
 
 import logging
 import os
@@ -25,26 +14,24 @@ log = logging.getLogger(__name__)
 
 
 class Our5Class(BaseDataset):
-    """Our 5-class MI dataset recorded with TMSi APEX.
+    """TMSi APEX 5-class MI dataset.
 
-    Dataset contains EEG recordings from 14 subjects performing 5 different motor imagery tasks:
-    left hand, right hand, left leg, right leg, and tongue movement.
+    14 subjects, 22 EEG channels at 1000 Hz raw, 5 MI classes
+    (left/right hand, left/right leg, tongue). Each subject has multiple
+    poly5 runs with companion `_markers.csv` files. The trial structure
+    is fixation cross -> visual cue -> "Imagine the movement" (trial
+    start) -> "Rest" (trial end), with a ~6 s MI period.
 
-    The experiment protocol was as follows: a fixation cross appeared, followed by a visual cue,
-    indicating the target movement. Then "Imagine the movement" text appeared (marking trial start),
-    and, finally, "Rest" text appeared (marking trial end). The MI period lasted about 6 seconds.
-
-    EEG was recorded using TMSi APEX with 22 channels at 1000 Hz sampling rate.
-    Channels follow the standard 10-20 montage with M1/M2 mastoid references.
-
-    Each subject has multiple recording runs (poly5 files) with corresponding marker files
-    indicating trial timings and labels.
-
-    Attributes:
-        CHANNELS: List of EEG channel names used in the recordings.
-        REF_CHANNELS: Reference channels for re-referencing.
-        MONTAGE: Standard montage for channel positions.
-        DEFAULT_SFREQ: Original sample frequency in Hz.
+    Timing:
+        Marker timestamps are on the experiment clock, which starts at
+        `ExperimentController.start()`. The recorder calls
+        `dev.start_measurement(...)` first and then schedules
+        `experiment.start` via `QTimer.singleShot(500, ...)`, so the
+        file clock leads the experiment clock by `PREAMBLE_S = 0.5` s.
+        The raw stays uncropped and every annotation onset is offset by
+        `PREAMBLE_S` so that experiment-clock t=0 lands at file-clock
+        t=PREAMBLE_S, where the MI actually began. MOABB ignores the
+        ~10-15 s trailing tail because it epochs around annotations.
     """
 
     CHANNELS = ["Fp1", "Fpz", "Fp2", "F7", "F3", "Fz", "F4", "F8", "T7", "C3", "Cz",
@@ -54,12 +41,13 @@ class Our5Class(BaseDataset):
     MONTAGE = "standard_1020"
     DEFAULT_SFREQ = 1000
 
-    # Marker timestamps are relative to experiment start, but each .poly5 recording has a
-    # variable-length preamble (the get-FPS phase) at its front. The experiment occupies
-    # exactly the last EXPERIMENT_DURATION_S seconds of the file, so we crop the preamble
-    # before attaching annotations to align marker t=0 with raw sample 0.
-    EXPERIMENT_DURATION_S = 600.0
-    EXPERIMENT_DURATION_S_OVERRIDES = {14: 767.55}
+    # Delay between dev.start_measurement and experiment.start in the
+    # recorder (QTimer.singleShot(500, experiment.start)). Added to every
+    # annotation onset to map experiment-clock onto file-clock seconds.
+    PREAMBLE_S = 0.5
+    # Soft upper bound on the trailing data after the last trial; longer
+    # tails suggest a paused or restarted acquisition.
+    _MAX_TAIL_S = 60.0
 
     def __init__(self, data_path="our_data/our_5_class", get_last_trials_xor=None):
         """
@@ -110,26 +98,23 @@ class Our5Class(BaseDataset):
         session_key = "0"  # Single session (subject doesn't take the headset off), multiple runs
         sessions[session_key] = dict()
 
-        experiment_duration_s = self.EXPERIMENT_DURATION_S_OVERRIDES.get(
-            subject, self.EXPERIMENT_DURATION_S)
-
         for run_idx, poly5_path in enumerate(poly5_files):
-            raw = self._load_single_run(poly5_path, experiment_duration_s)
+            raw = self._load_single_run(poly5_path, subject=subject)
             sessions[session_key][str(run_idx)] = raw
 
         return sessions
 
-    def _load_single_run(self, poly5_path: Path, experiment_duration_s: float) -> mne.io.RawArray:
+    def _load_single_run(self, poly5_path: Path, subject: int) -> mne.io.RawArray:
         """Load and preprocess a single recording run.
 
         Args:
             poly5_path: Path to the poly5 file.
-            experiment_duration_s: Expected duration of the experiment in seconds. The file's
-                leading preamble (file duration - experiment_duration_s) is cropped off so
-                marker timestamps (experiment-relative) align with raw sample 0.
+            subject: Subject id, used only for logging context.
 
         Returns:
             MNE Raw object with proper channel types, montage, and event annotations added.
+            The raw is kept uncropped; marker onsets are offset by ``PREAMBLE_S`` so that
+            experiment-clock t=0 maps to file-clock t=PREAMBLE_S.
         """
         # Suppress Poly5Reader verbose output
         with open(os.devnull, 'w') as devnull:
@@ -152,21 +137,62 @@ class Our5Class(BaseDataset):
         raw.set_eeg_reference(ref_channels=self.REF_CHANNELS)
         raw.drop_channels(self.REF_CHANNELS)
 
-        # Crop preamble so marker t=0 aligns with sample 0
-        file_duration_s = raw.n_times / raw.info["sfreq"]
-        crop_tmin = file_duration_s - experiment_duration_s
-        if crop_tmin < 0:
-            raise ValueError(
-                f"File {poly5_path.name} is shorter ({file_duration_s:.2f}s) than expected "
-                f"experiment duration ({experiment_duration_s:.2f}s)")
-        raw.crop(tmin=crop_tmin)
-
-        # Load markers as annotations
+        # Load markers and attach as annotations, offset by PREAMBLE_S so that experiment
+        # clock t=0 (the marker origin) maps onto file-clock t=PREAMBLE_S
         markers = self._load_markers(poly5_path)
+        self._sanity_log(poly5_path, raw, markers, subject)
         if markers:
             self._add_annotations(raw, markers)
 
         return raw
+
+    def _sanity_log(self, poly5_path: Path, raw: mne.io.BaseRaw,
+                    markers: list[dict], subject: int) -> None:
+        """Log per-file timing summary and warn on suspicious recordings.
+
+        Compares file duration against the time of the last marker plus PREAMBLE_S to
+        detect truncated recordings (file ends before the last trial) or excessively long
+        trailing data (possible paused acquisition or other mishap).
+
+        Args:
+            poly5_path: Path to the poly5 file (used for log identification).
+            raw: Loaded MNE raw (must already have its preamble untouched).
+            markers: Parsed marker list for this run (may be empty).
+            subject: Subject id, used only for logging context.
+        """
+        file_duration_s = raw.n_times / raw.info["sfreq"]
+        n_markers = len(markers)
+        if not markers:
+            log.warning(
+                "[Our5Class] subject=%d file=%s file_dur=%.2fs n_markers=0",
+                subject, poly5_path.name, file_duration_s)
+            return
+
+        try:
+            last_end = max(float(m["time_end_s"]) for m in markers)
+        except (KeyError, ValueError) as e:
+            log.warning("[Our5Class] subject=%d file=%s could not parse last marker: %s",
+                        subject, poly5_path.name, e)
+            return
+
+        expected_min = self.PREAMBLE_S + last_end
+        log.info(
+            "[Our5Class] subject=%d file=%s file_dur=%.2fs n_markers=%d "
+            "last_marker_end=%.2fs expected_min_dur=%.2fs tail=%.2fs",
+            subject, poly5_path.name, file_duration_s, n_markers,
+            last_end, expected_min, file_duration_s - expected_min)
+
+        if file_duration_s < expected_min:
+            log.warning(
+                "[Our5Class] subject=%d file=%s: file truncated, duration %.2fs < "
+                "expected %.2fs (last marker refers to data beyond end of file)",
+                subject, poly5_path.name, file_duration_s, expected_min)
+        elif file_duration_s > expected_min + self._MAX_TAIL_S:
+            log.warning(
+                "[Our5Class] subject=%d file=%s: excessive trailing data, file_dur=%.2fs "
+                "vs expected_min=%.2fs (tail=%.2fs > %.0fs); possible recording mishap",
+                subject, poly5_path.name, file_duration_s, expected_min,
+                file_duration_s - expected_min, self._MAX_TAIL_S)
 
     def _load_markers(self, poly5_path: Path) -> list[dict]:
         """Load trial markers from CSV corresponding to a poly5 file.
@@ -195,6 +221,9 @@ class Our5Class(BaseDataset):
         MOABB paradigms expect events to be annotated in a stim channel or as annotations.
         We use annotations.
 
+        Marker `time_start_s` is on the experiment clock; we add `PREAMBLE_S` to land on
+        the file clock so that the annotation lines up with the actual MI sample.
+
         Args:
             raw: MNE Raw object to add annotations to (modified in-place).
             markers: List of marker dicts.
@@ -205,11 +234,11 @@ class Our5Class(BaseDataset):
 
         for marker in markers:
             try:
-                onset = float(marker["time_start_s"])
-                end = float(marker["time_end_s"])
+                onset = float(marker["time_start_s"]) + self.PREAMBLE_S
+                end = float(marker["time_end_s"]) + self.PREAMBLE_S
                 duration = end - onset
                 body_part = marker["body_part"]
-                event_name = body_part.lower().replace(" ", "_") # MOABB event naming convention
+                event_name = body_part.lower().replace(" ", "_")  # MOABB event naming convention
 
                 onsets.append(onset)
                 durations.append(duration)

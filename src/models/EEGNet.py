@@ -71,6 +71,8 @@ class EEGNet(nn.Module):
             dropout: float = 0.5,
             depth_max_norm: float = 1.0,
             cls_max_norm: float = 0.25,
+            endpool_ms: float = None,
+            sfreq: float = 250.0,
     ):
         super().__init__()
 
@@ -106,7 +108,24 @@ class EEGNet(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, 1, in_channels, n_times)
             feat = self.separable(self.block2(self.depthwise(self.block1(dummy))))
-        flat_dim = feat.numel()
+        # feat shape: (1, f2, 1, t_feat)
+        t_feat = feat.shape[-1]
+
+        # Deployment-honest end-of-window pooling: average over the most-recent
+        # `endpool_ms` of the input window. We translate ms-of-input into
+        # frames-of-feature-map via the cumulative time stride of the two pools
+        # (block2 / separable each downsample by pool1 / pool2 respectively).
+        # endpool_ms=None -> legacy full-flatten behaviour.
+        self.endpool_ms = endpool_ms
+        if endpool_ms is None:
+            self.endpool_frames = None
+            flat_dim = feat.numel()
+        else:
+            time_stride = pool1 * pool2
+            k_input = max(1, int(round(endpool_ms * 1e-3 * sfreq)))
+            k_feat = max(1, min(t_feat, int(round(k_input / time_stride))))
+            self.endpool_frames = k_feat
+            flat_dim = f2
 
         self.classifier = nn.Linear(flat_dim, num_classes)
         self.classifier.register_forward_pre_hook(_MaxNormHook(cls_max_norm))
@@ -126,6 +145,8 @@ class EEGNet(nn.Module):
             pool2=cfg.model.pool2,
             sep_kernel=cfg.model.sep_kernel,
             dropout=cfg.model.dropout,
+            endpool_ms=cfg.model.get("endpool_ms", None),
+            sfreq=float(cfg.preprocessing.resample_rate),
         )
 
     def forward(self, x):
@@ -135,7 +156,12 @@ class EEGNet(nn.Module):
         x = self.depthwise(x)
         x = self.block2(x)
         x = self.separable(x)
-        x = x.flatten(1)
+        # x: (B, f2, 1, t_feat)
+        if self.endpool_frames is None:
+            x = x.flatten(1)
+        else:
+            x = x[..., -self.endpool_frames:].mean(dim=-1)  # (B, f2, 1)
+            x = x.flatten(1)
         return self.classifier(x)
 
 

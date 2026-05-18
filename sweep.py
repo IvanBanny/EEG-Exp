@@ -1,9 +1,13 @@
-"""Hyperparameter sweep CLI.
+"""Hyperparameter sweep CLI (Optuna + ASHA pruning).
+
+Builds the base config's datasets once, runs sequential trials over
+the search space declared in `sweeps/<name>_sweep.py`, and emits
+`configs/<base>__best__<study>.py` at the end.
 
 Usage:
-    python sweep.py --sweep raw_bci_cnnbilstm_sweep --trials 100
-    python sweep.py --sweep raw_bci_cnnbilstm_sweep --smoke
-    python sweep.py --sweep <name> --trials 200 --study-name lr_v2
+    python sweep.py --sweep raw_cnnbilstm_sweep --trials 100
+    python sweep.py --sweep raw_cnnbilstm_sweep --smoke
+    python sweep.py --sweep raw_cnnbilstm_sweep --trials 200 --study-name lr_v2
 """
 
 import argparse
@@ -32,7 +36,7 @@ _STUDY_DIR = Path("sweeps/.studies")
 def _apply_overrides(cfg, overrides: dict):
     """Apply dotted-path overrides to a (possibly locked) ConfigDict.
 
-    Re-locks the config before returning to mirror the contract of base configs.
+    Re-locks the config before returning to mirror the base-config contract.
     """
     with cfg.unlocked():
         for dotted, value in overrides.items():
@@ -55,12 +59,13 @@ def _validate_overrides(overrides: dict):
         )
 
 
-def _build_transforms(cfg):
+def _build_transforms(cfg, subject_normalizer=None):
     """Mirror train.py transform construction exactly."""
     base = [ClipOutliers(sigma=cfg.regularization.clip_sigma)]
     if cfg.preprocessing.representation == "stft":
         base.append(LogCompress())
-    base.append(ZScoreNormalize())
+    if subject_normalizer is None:
+        base.append(ZScoreNormalize())
     train_transform = Compose(base + [
         GaussianNoise(std=cfg.regularization.gaussian_std),
         RandomScale(scale_fork=cfg.regularization.scale_fork),
@@ -78,7 +83,8 @@ def _seed_all(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def _make_objective(sweep_module, base_seed, max_epochs, train_ds, val_ds, device, study_name):
+def _make_objective(sweep_module, base_seed, max_epochs, train_ds, val_ds,
+                    device, study_name, subject_normalizer=None):
     base_cfg_name = sweep_module.BASE_CONFIG
     metric = sweep_module.METRIC
     direction = sweep_module.DIRECTION
@@ -95,8 +101,8 @@ def _make_objective(sweep_module, base_seed, max_epochs, train_ds, val_ds, devic
             cfg.training.epochs = max_epochs
             cfg.seed = base_seed + trial.number
             cfg.model.checkpoint_name = f"{study_name}_t{trial.number}"
-            # In-memory datasets + small models => DataLoader worker spawn
-            # dominates per-trial cost. Drop to a single producer.
+            # In-memory datasets + small models -> DataLoader worker
+            # spawn dominates per-trial cost. Drop to a single producer.
             cfg.data.num_workers = 2
         cfg.lock()
 
@@ -104,12 +110,13 @@ def _make_objective(sweep_module, base_seed, max_epochs, train_ds, val_ds, devic
 
         try:
             model, criterion, optimizer, scheduler = build_model(cfg, device)
-            train_transform, val_transform = _build_transforms(cfg)
+            train_transform, val_transform = _build_transforms(cfg, subject_normalizer)
 
             trainer = ClassicTrainer(
                 model, criterion, optimizer,
                 train_transform, val_transform,
                 scheduler, device, cfg, sweep_mode=True,
+                subject_normalizer=subject_normalizer,
             )
 
             def epoch_callback(epoch: int, metrics: dict):
@@ -139,18 +146,18 @@ def _load_sweep_module(name: str):
 
 def _write_best_config(base_cfg_name: str, study_name: str, best_params: dict,
                        sweep_module) -> Path:
-    """Emit configs/<base>__best__<study>.py that bakes the best params in."""
+    """Emit `configs/<base>__best__<study>.py` baking in the best params."""
     out_path = Path("configs") / f"{base_cfg_name}__best__{study_name}.py"
 
-    # The sweep file's define_space maps trial-suggest names to dotted config paths.
-    # We re-derive that mapping by intercepting suggest_* calls so we can convert
-    # Optuna's best_params (keyed by suggest names) into config dotted-path overrides.
+    # define_space maps trial-suggest names to dotted config paths.
+    # Re-derive that mapping by intercepting suggest_* calls so we can
+    # convert Optuna's best_params (keyed by suggest names) into the
+    # dotted-path overrides this config file applies.
     name_to_dotted = _resolve_param_mapping(sweep_module)
 
     overrides = {}
     for suggest_name, value in best_params.items():
         if suggest_name not in name_to_dotted:
-            # parameter not surfaced via define_space (should not happen); skip
             continue
         overrides[name_to_dotted[suggest_name]] = value
 
@@ -175,13 +182,18 @@ def _write_best_config(base_cfg_name: str, study_name: str, best_params: dict,
 
 
 def _resolve_param_mapping(sweep_module) -> dict:
-    """Recover {suggest_name: dotted_config_path} by running define_space against a recording trial."""
-    class _RecordingTrial:
-        def __init__(self):
-            self.last_name = None
+    """Recover {suggest_name: dotted_config_path}.
 
+    Runs `define_space` against a recording trial that captures the
+    order of suggest_* calls, then pairs them against the returned
+    dotted-path keys. Falls back to an identity mapping if the call
+    order does not line up (conditional suggestions).
+    """
+    calls = []
+
+    class _RecordingTrial:
         def _record(self, name, default):
-            self.last_name = name
+            calls.append(name)
             return default
 
         def suggest_float(self, name, low, high, log=False, step=None):
@@ -193,22 +205,9 @@ def _resolve_param_mapping(sweep_module) -> dict:
         def suggest_categorical(self, name, choices):
             return self._record(name, choices[0])
 
-    # Run define_space and capture order of suggest calls vs returned dict keys.
-    # The cleanest mapping: call once, but we need name <-> dotted-path pairs.
-    # Re-run define_space and pair by call order using a mutable list.
-    calls = []
-
-    class _OrderedTrial(_RecordingTrial):
-        def _record(self, name, default):
-            calls.append(name)
-            return default
-
-    rec = _OrderedTrial()
-    overrides = sweep_module.define_space(rec)
+    overrides = sweep_module.define_space(_RecordingTrial())
     dotted_paths = list(overrides.keys())
     if len(dotted_paths) != len(calls):
-        # define_space did something fancy (e.g. conditional suggestions)
-        # Fall back to identity mapping where possible
         return {name: name for name in calls}
     return dict(zip(calls, dotted_paths))
 
@@ -250,11 +249,12 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Build datasets ONCE - sweep is forbidden from overriding data/preprocessing,
-    # so the cached datasets are valid across all trials in the study.
+    # Build datasets once - sweep is forbidden from overriding
+    # data/preprocessing, so the cached datasets are valid across all
+    # trials in the study.
     _seed_all(seed)
     print(f"\nBuilding datasets (base config: {base_cfg_name})...")
-    train_ds, val_ds = build_datasets(base_cfg)
+    train_ds, val_ds, subject_normalizer = build_datasets(base_cfg)
 
     sampler = TPESampler(multivariate=True, group=True, seed=seed)
     pruner = SuccessiveHalvingPruner(
@@ -274,6 +274,7 @@ def main():
     objective = _make_objective(
         sweep_module, base_seed=seed, max_epochs=max_epochs,
         train_ds=train_ds, val_ds=val_ds, device=device, study_name=study_name,
+        subject_normalizer=subject_normalizer,
     )
 
     print(f"\nStudy: {study_name} | trials_to_run: {n_trials} | max_epochs: {max_epochs}")
